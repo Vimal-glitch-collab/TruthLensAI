@@ -1,0 +1,27 @@
+# Deploy from this application's directory when using a standalone checkout.
+services:
+  - type: web
+    name: truthlensai-api
+    runtime: python
+    region: singapore
+    plan: 1c-2g
+    buildCommand: pip install -r requirements.txt -r requirements-models.txt && python setup_models.py
+    startCommand: python server.py
+    healthCheckPath: /healthz
+    disk:
+      name: truthlens-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.12
+      - key: TRUTHLENS_BIND
+        value: 0.0.0.0
+      - key: TRUTHLENS_DATA_DIR
+        value: /var/data
+      - key: TRUTHLENS_WORKERS
+        value: "1"
+      - key: TRUTHLENS_PUBLIC_ORIGIN
+        sync: false
+      - key: TRUTHLENS_ALLOW_REGISTRATION
+        value: "1"

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageChops, ImageOps, UnidentifiedImageError
+from .evidence import (visual_evidence, detect_faces, face_crop, annotate_faces,
+                       associate_faces, compare_images, provenance, extract_claims, lookup_claims)
 
 ROOT = Path(__file__).resolve().parent.parent
 Image.MAX_IMAGE_PIXELS = 20_000_000
@@ -21,6 +23,23 @@ FEATURE_NAMES = ['ela_mean', 'ela_p95', 'laplacian_variance', 'noise_std', 'satu
 
 class AnalysisError(ValueError):
     pass
+
+
+class Cancelled(AnalysisError):
+    pass
+
+
+def model_config_path(kind='image'):
+    default = ROOT / 'models/onnx.json'
+    if kind == 'image' and (ROOT / 'models/image-detector.json').is_file():
+        default = ROOT / 'models/image-detector.json'
+    override = 'TRUTHLENS_VIDEO_ONNX_CONFIG' if kind == 'video' and 'TRUTHLENS_VIDEO_ONNX_CONFIG' in os.environ else 'TRUTHLENS_ONNX_CONFIG'
+    return os.environ.get(override, str(default) if default.is_file() else '')
+
+
+def notify(progress, value, stage):
+    if progress:
+        progress(value, stage)
 
 
 def finding(name, status, detail, value=None):
@@ -69,14 +88,22 @@ def feature_prediction(image):
     path = Path(os.environ.get('TRUTHLENS_FEATURE_MODEL', ROOT / 'models/feature-model.json'))
     if not path.is_file():
         return None
-    model = json.loads(path.read_text(encoding='utf-8'))
+    try:
+        model = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(model, dict):
+            raise ValueError('Expected an object')
+        mean, scale, weights = [np.asarray(model[key], dtype=float) for key in ('mean', 'scale', 'weights')]
+        bias = float(model['bias'])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise AnalysisError('Invalid feature-model parameters.') from exc
     if model.get('features') != FEATURE_NAMES:
         raise AnalysisError('The feature model uses an unsupported feature schema.')
     vec = features(image)
-    mean, scale, weights = [np.asarray(model[key], dtype=float) for key in ('mean', 'scale', 'weights')]
-    if any(x.shape != (5,) or not np.isfinite(x).all() for x in (mean, scale, weights)) or np.any(scale <= 0):
+    if not math.isfinite(bias) or any(x.shape != (5,) or not np.isfinite(x).all() for x in (mean, scale, weights)) or np.any(scale <= 0):
         raise AnalysisError('Invalid feature-model parameters.')
-    z = float(((vec - mean) / scale) @ weights + float(model['bias']))
+    z = float(((vec - mean) / scale) @ weights + bias)
+    if not math.isfinite(z):
+        raise AnalysisError('Feature-model computation returned a nonfinite output.')
     probability = float(1 / (1 + np.exp(-np.clip(z, -40, 40))))
     return dict(name=model.get('name', 'Feature classifier'), method='Logistic regression on forensic features',
                 manipulated_probability=round(probability, 4), scope='Whole image; domain-dependent and uncalibrated',
@@ -91,17 +118,40 @@ def onnx_session(model_path, modified):
     return ort.InferenceSession(model_path, sess_options=options, providers=['CPUExecutionProvider'])
 
 
-def onnx_prediction(image):
-    config_path = os.environ.get('TRUTHLENS_ONNX_CONFIG')
+@lru_cache(maxsize=4)
+def checked_model_hash(path, modified, size):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def prepare_onnx_image(image, config):
+    size = int(config.get('size', 224))
+    if not 16 <= size <= 1024:
+        raise AnalysisError('ONNX input size must be between 16 and 1024.')
+    method = config.get('resample', 'bicubic')
+    resampling = Image.Resampling.BILINEAR if method == 'bilinear' else Image.Resampling.BICUBIC
+    shorter = config.get('resize_shorter')
+    if shorter is not None:
+        shorter = int(shorter)
+        if not size <= shorter <= 2048:
+            raise AnalysisError('Invalid shorter-edge resize.')
+        w, h = image.size
+        target = (shorter, int(shorter*h/w)) if w < h else (int(shorter*w/h), shorter)
+        if max(target) > 16384:
+            raise AnalysisError('Image aspect ratio is too extreme for this model.')
+        image = image.resize(target, resampling)
+        left, top = round((image.width-size)/2), round((image.height-size)/2)
+        return image.crop((left, top, left+size, top+size))
+    return image.resize((size, size), resampling)
+
+
+def onnx_prediction(image, config_path=None):
+    config_path = model_config_path() if config_path is None else config_path
     if not config_path:
         return None
-    config_file = Path(config_path).resolve()
-    config = json.loads(config_file.read_text(encoding='utf-8'))
-    model_path = (config_file.parent / config['model_path']).resolve()
-    size = int(config.get('size', 224))
-    if size < 16 or size > 1024:
-        raise AnalysisError('ONNX input size must be between 16 and 1024.')
-    tensor = np.asarray(image.resize((size, size)), dtype=np.float32) / 255.0
+    config, model_path, stat = load_onnx_config(config_path)
+    if config.get('sha256') and checked_model_hash(str(model_path), stat.st_mtime_ns, stat.st_size) != config['sha256']:
+        raise AnalysisError('Model checksum does not match its pinned configuration.')
+    tensor = np.asarray(prepare_onnx_image(image, config), dtype=np.float32) / 255.0
     mean = np.asarray(config.get('mean', [.485, .456, .406]), dtype=np.float32)
     std = np.asarray(config.get('std', [.229, .224, .225]), dtype=np.float32)
     if mean.shape != (3,) or std.shape != (3,) or not np.isfinite(mean).all() or not np.isfinite(std).all() or np.any(std <= 0):
@@ -125,11 +175,74 @@ def onnx_prediction(image):
     else:
         raise AnalysisError('ONNX output does not match the configured binary classification contract.')
     return dict(name=config.get('name', 'ONNX detector'), method='Deep learning / ONNX',
-                manipulated_probability=round(probability, 4), scope='Resized whole image, not face crops',
+                manipulated_probability=probability if config.get('prediction_task') == 'ai_generation' else round(probability, 4),
+                prediction_task=config.get('prediction_task'),
+                scope=config.get('scope', 'Resized whole image, not face crops'),
+                source=config.get('source'), revision=config.get('revision'), license=config.get('license'),
+                evaluation_status=config.get('evaluation_status', 'No independent evaluation supplied'),
                 note='Interpret only within the model’s documented training domain; this is not a calibrated confidence.')
 
 
-def image_report(data, name):
+def load_onnx_config(config_path):
+    try:
+        config_file = Path(config_path).resolve()
+        config = json.loads(config_file.read_text(encoding='utf-8'))
+        if not isinstance(config, dict) or not isinstance(config.get('model_path'), str) or not config['model_path']:
+            raise ValueError('Missing model_path')
+        model_path = (config_file.parent / config['model_path']).resolve()
+    except (OSError, ValueError, TypeError) as exc:
+        raise AnalysisError('The detector configuration is missing or invalid. Check the configured ONNX JSON file.') from exc
+    try:
+        stat = model_path.stat()
+        if not model_path.is_file():
+            raise OSError('Not a model file')
+    except OSError as exc:
+        raise AnalysisError('Detector weights are missing or unreadable. Run setup.ps1 (or python setup_models.py) and restart the server.') from exc
+    return config, model_path, stat
+
+
+def detector_status(kind='image'):
+    path = model_config_path(kind)
+    if not path:
+        return {'available': False, 'status': 'disabled', 'message': 'ONNX inference is disabled.'}
+    try:
+        config, model, stat = load_onnx_config(path)
+        # Exercise the same preprocessing, checksum and output contract as real inference.
+        probe_detector(str(Path(path).resolve()), Path(path).read_bytes(), str(model), stat.st_mtime_ns, stat.st_size)
+        return {'available': True, 'status': 'ready', 'prediction_task': config.get('prediction_task'),
+                'message': 'Detector loaded and inference checked. Scores are uncalibrated.'}
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, AnalysisError) else 'Detector could not be loaded. Check dependencies and the ONNX model contract.'
+        return {'available': False, 'status': 'unavailable', 'message': message}
+
+
+@lru_cache(maxsize=4)
+def probe_detector(config_path, config_bytes, model_path, modified, size):
+    onnx_prediction(Image.new('RGB', (256, 256)), config_path)
+
+
+def detector_prediction(image, boxes=None, kind='image'):
+    config_path = model_config_path(kind)
+    if config_path:
+        config, _, _ = load_onnx_config(config_path)
+        if config.get('domain') == 'faces':
+            boxes = detect_faces(image) if boxes is None else boxes
+            predictions = []
+            for box in boxes[:3]:
+                prediction = onnx_prediction(face_crop(image, box), config_path)
+                box['model_probability'] = prediction['manipulated_probability']
+                predictions.append(prediction)
+            if not predictions:
+                return None
+            return {**predictions[0], 'manipulated_probability':round(float(np.mean([p['manipulated_probability'] for p in predictions])), 4),
+                    'scope':'Mean output across detected face crops; geometric face detection can miss faces or produce false detections',
+                    'faces_analyzed':len(predictions), 'face_predictions':[dict(box) for box in boxes]}
+        return onnx_prediction(image, config_path)
+    return feature_prediction(image)
+
+
+def image_report(data, name, progress=None, reference_data=None):
+    notify(progress, 10, 'Decoding image')
     image, meta = load_image(data)
     values = features(image)
     report = base_report('image', name, data)
@@ -141,14 +254,44 @@ def image_report(data, name):
                 'No editing-software tag was found. Missing metadata is common and is not evidence of authenticity.'),
         finding('Recompression residual', 'observed', 'Mean pixel difference after JPEG recompression at quality 90. Texture, prior compression, and format conversion affect this value.', round(float(values[0]), 3)),
         finding('Fine-detail variation', 'observed', 'Laplacian variance measures image detail. Blur, texture, sharpening, and compression affect it; it cannot identify a deepfake.', round(float(values[2]), 3))]
-    report['model'] = onnx_prediction(image) or feature_prediction(image)
-    report['limitations'] = ['No source or provenance verification was performed.', 'Residuals and metadata cannot reliably distinguish manipulation from ordinary editing.',
-                             'No validated detector is bundled. Model predictions appear only when a local trained model is configured.']
+    notify(progress, 30, 'Building visual evidence')
+    report['visuals'] = visual_evidence(image)
+    faces = detect_faces(image)
+    report['metrics']['faces_detected'] = len(faces)
+    notify(progress, 50, 'Running image detector')
+    report['model'] = detector_prediction(image, faces)
+    if report['model'] and report['model'].get('prediction_task') == 'ai_generation':
+        from .prediction import image_prediction
+        report['prediction'] = image_prediction(image, report['model'], detector_prediction)
+        from .validation import status as benchmark_status
+        benchmark = benchmark_status(ROOT)
+        report['prediction']['benchmark'] = {'status':benchmark['status'], 'message':benchmark['message'],
+            'selective':benchmark.get('selective'), 'original':benchmark.get('variants',{}).get('original')}
+        report['verdict'] = report['prediction']['label']
+        report['summary'] = report['prediction']['explanation']
+    if faces:
+        report['visuals']['face_preview'] = annotate_faces(image, faces)
+    report['faces'] = faces
+    notify(progress, 75, 'Checking Content Credentials')
+    report['provenance'] = provenance(data, {'JPEG':'image/jpeg','PNG':'image/png','WEBP':'image/webp'}[meta['format']])
+    if reference_data:
+        reference, _ = load_image(reference_data)
+        report['comparison'] = compare_images(image, reference)
+        report['comparison']['reference_sha256'] = hashlib.sha256(reference_data).hexdigest()
+    report['limitations'] = ['Residuals and metadata cannot reliably distinguish manipulation from ordinary editing.',
+                             'The pretrained detector targets face images and is not independently validated or calibrated by TruthLens.',
+                             'If no face is detected, the face-domain detector is skipped. Credentials establish provenance, not factual truth.']
+    if report.get('prediction'):
+        report['limitations'] = [
+            'The classifier distinguishes AI-generated imagery from photographs; it does not detect every Photoshop edit, face swap, or misleading context.',
+            'Scores are uncalibrated. Likely real does not establish an untouched original or factual truth.',
+            'The center crop excludes image borders. New generators, screenshots, illustrations and distribution shifts can defeat the detector.',
+            'Public benchmark measurements apply to sampled dataset-viewer JPEG previews; training overlap has not been independently audited.']
     report['next_steps'] = ['Find the earliest available original image and compare it.', 'Check the publisher and context; use a reverse-image search.', 'Request the original file or provenance credentials when possible.']
     return report
 
 
-def video_report(path, name, digest):
+def video_report(path, name, digest, progress=None):
     try:
         import cv2
     except ImportError as exc:
@@ -163,8 +306,10 @@ def video_report(path, name, digest):
         if width * height > 8_300_000 or count / fps > 120:
             raise AnalysisError('Use a video up to 2 minutes and 4K resolution.')
         samples, previous, differences, blur, predictions = [], None, [], [], []
+        previous_faces, next_id = [], 1
         indices = np.unique(np.linspace(0, count - 1, min(24, count), dtype=int))
-        for index in indices:
+        for sample_index, index in enumerate(indices):
+            notify(progress, 10 + int(65 * sample_index / len(indices)), f'Inspecting frame {sample_index + 1} of {len(indices)}')
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
             ok, frame = cap.read()
             if not ok:
@@ -178,31 +323,61 @@ def video_report(path, name, digest):
             blur.append(detail)
             samples.append(dict(time=round(int(index) / fps, 2), detail=round(detail, 2), difference=round(delta, 2) if delta is not None else None))
             image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            prediction = onnx_prediction(image) or feature_prediction(image)
+            boxes = detect_faces(image)
+            next_id = associate_faces(boxes, previous_faces, next_id)
+            prediction = detector_prediction(image, boxes, kind='video')
+            samples[-1]['faces'] = boxes
+            samples[-1]['thumbnail'] = annotate_faces(image, boxes)
+            previous_faces = boxes
             if prediction:
                 predictions.append(prediction)
                 samples[-1]['model_probability'] = prediction['manipulated_probability']
             previous = gray.astype(float)
         if not samples:
             raise AnalysisError('No frames could be decoded from this video.')
+        # Inspect short consecutive windows around the largest sampled visual changes.
+        windows = []
+        largest = sorted([sample for sample in samples if sample['difference'] is not None], key=lambda sample: sample['difference'], reverse=True)[:3]
+        for location in largest:
+            notify(progress, 78, 'Inspecting consecutive frames around visual changes')
+            center = round(location['time'] * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, center - 2))
+            prior, changes = None, []
+            for _ in range(5):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                gray = cv2.cvtColor(cv2.resize(frame, (256, 144)), cv2.COLOR_BGR2GRAY).astype(float)
+                if prior is not None:
+                    changes.append(round(float(np.abs(gray - prior).mean()), 2))
+                prior = gray
+            windows.append({'center_seconds':location['time'], 'consecutive_frame_differences':changes,
+                            'interpretation':'Motion or scene-cut signal; not a temporal deepfake prediction'})
         report = base_report('video', name, b'')
         report['sha256'] = digest
-        report['metrics'] = dict(width=width, height=height, fps=round(fps, 2), duration_seconds=round(count / fps, 2), frames_sampled=len(samples), samples=samples)
+        report['metrics'] = dict(width=width, height=height, fps=round(fps, 2), duration_seconds=round(count / fps, 2), frames_sampled=len(samples), samples=samples,
+                                face_tracks=max(0,next_id-1), temporal_windows=windows)
         report['findings'] = [finding('Video structure', 'observed', f'{len(samples)} frames sampled uniformly across {count / fps:.1f} seconds.'),
                               finding('Visual changes', 'observed', 'Mean grayscale change between widely spaced samples. Scene cuts and camera motion can cause large changes.', round(float(np.mean(differences)), 2) if differences else 0),
                               finding('Detail variation', 'observed', 'Changes in frame detail may reflect focus, lighting, resolution, or encoding.', round(float(np.std(blur)), 2))]
         if predictions:
             report['model'] = {**predictions[0], 'manipulated_probability': round(float(np.mean([p['manipulated_probability'] for p in predictions])), 4),
-                               'scope': 'Mean whole-frame image-model output across sampled frames; not a temporal or face-specific video classifier'}
-        report['limitations'] = ['Sparse frame sampling can miss brief manipulations.', 'No audio, lip-sync, face identity, or provenance analysis is performed.',
-                                 'Temporal measurements are not a trained deepfake classifier. Optional image models analyze whole frames and may be unsuitable for video.']
+                               'scope': 'Mean image-detector output across sampled frames with eligible detections; not a temporal video classifier',
+                               'frames_scored':len(predictions)}
+        notify(progress, 88, 'Checking video provenance')
+        mime = 'video/mp4' if path.suffix.lower() in ('.mp4','.mov') else 'video/webm' if path.suffix.lower() == '.webm' else 'video/x-msvideo'
+        report['provenance'] = provenance(path.read_bytes(), mime)
+        report['limitations'] = ['Sparse frame sampling can miss brief manipulations.', 'No audio, lip-sync, or facial-identity recognition is performed.',
+                                 'Track IDs use geometric overlap only. They can change after motion or cuts and do not identify a person.',
+                                 'Consecutive-frame measurements are not a trained temporal detector. Face-image models may be unsuitable for some video domains.']
         report['next_steps'] = ['Compare with an original recording from a reliable source.', 'Examine suspicious segments frame by frame and listen for audio edits.', 'Verify the statement with the speaker’s official channels.']
         return report
     finally:
         cap.release()
 
 
-def news_report(text, name, source_url=''):
+def news_report(text, name, source_url='', online=False, progress=None):
+    notify(progress, 15, 'Extracting language cues and claim candidates')
     if len(text.strip()) < 40:
         raise AnalysisError('Paste at least 40 characters of article text.')
     if len(text) > 50_000:
@@ -221,6 +396,11 @@ def news_report(text, name, source_url=''):
         finding('Linked evidence', 'observed' if links else 'review', f'{len(links)} links found in the pasted text. Links have not been fetched or verified.'),
         finding('Emphasis', 'review' if len(uppercase) > 3 or text.count('!') > 3 else 'observed', f'{len(uppercase)} uppercase words and {text.count("!")} exclamation marks. Style is not a truth verdict.')]
     report['summary'] = 'Language cues for editorial review. The factual claims remain unverified.'
-    report['limitations'] = ['English-language rule-based analysis, not a trained misinformation model.', 'No browsing, source retrieval, claim verification, or fact-check matching is performed.', 'Language style cannot determine whether a claim is true.']
+    report['claims'] = extract_claims(text)
+    report['highlighted_passages'] = [{'text':m.group(), 'start':m.start(), 'end':m.end(), 'reason':'Loaded-language lexicon match'} for phrase in matches for m in re.finditer(re.escape(phrase), text, re.I)][:30]
+    report['lookup'] = lookup_claims(report['claims'], os.environ.get('GOOGLE_FACT_CHECK_API_KEY',''), progress) if online else {'status':'disabled', 'note':'Online lookup was not enabled. No claim text was transmitted.'}
+    report['limitations'] = ['English-language rule-based claim extraction and language cues; important claims may be missed.',
+                             'Retrieved reviews are candidate sources. Their ratings are not applied automatically to a different claim.',
+                             'No match means insufficient evidence. Language style cannot determine whether a claim is true.']
     report['next_steps'] = ['Identify the article’s specific claims and check their primary evidence.', 'Check the author, publication date, and cited sources.', 'Compare coverage from independent outlets and relevant fact-checkers.']
     return report

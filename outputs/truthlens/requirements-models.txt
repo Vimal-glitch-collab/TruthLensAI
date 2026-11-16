@@ -1,0 +1,2 @@
+# Build dependency for the deterministic image-model exporter; not needed at runtime.
+onnx==1.19.1
